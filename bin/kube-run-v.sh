@@ -49,16 +49,24 @@ function f-msys-escape() {
     if type uname 2>/dev/null 1>/dev/null ; then
         local result=$( uname -o )
         if [ x"$result"x = x"Cygwin"x ]; then
-            FSYS_FLAG=
+            MSYS_FLAG=
             # if not MSYS, normal return
             echo "$@"
             return 0
         fi
     fi
 
+    # check Msys
+    if type uname 2>/dev/null 1>/dev/null ; then
+        local result=$( uname -o )
+        if [ x"$result"x = x"Msys"x ]; then
+            MSYS_FLAG=true
+        fi
+    fi
+
     # check cmd is found
     if type cmd 2>/dev/null 1>/dev/null ; then
-        # check msys convert
+        # check msys convert ( Git for Windows )
         local result=$( cmd //c echo "/CN=Name")
         if [ x"$result"x = x"/CN=Name"x ]; then 
             MSYS_FLAG=
@@ -181,6 +189,26 @@ function f-check-kubeconfig-carry-on() {
     fi
 }
 
+# kubernetes 1.18 以降なら kubectl run --dry-run=client --output=json とする
+# kubernetes 1.18 以前なら kubectl run --dry-run
+function f-check-dry-run-pod() {
+    export KUBE_SERV_VERSION=$( f-kubernetes-server-version )
+    if [ -z "$KUBE_SERV_VERSION" ]; then
+        echo "no"
+        return
+    fi
+    local NOW_KUBE_SERV_VERSION=$( f-version-convert $KUBE_SERV_VERSION )
+    local CMP_KUBE_SERV_VERSION=$( f-version-convert "1.18.0" )
+    if [ $CMP_KUBE_SERV_VERSION -le $NOW_KUBE_SERV_VERSION ]; then
+        echo "yes"
+        return
+    else
+        echo "no"
+        return
+    fi
+}
+
+# kubernetes 1.18 では廃止された。
 # kubernetes 1.17 以降なら kubectl run --generator=run-pod/v1 とする yesを返却
 # kubernetes 1.16 以前なら kubectl run で良い no を返却
 function f-check-generator-run-pod() {
@@ -190,6 +218,11 @@ function f-check-generator-run-pod() {
         return
     fi
     local NOW_KUBE_SERV_VERSION=$( f-version-convert $KUBE_SERV_VERSION )
+    local CMP_KUBE_SERV_VERSION=$( f-version-convert "1.18.0" )
+    if [ $CMP_KUBE_SERV_VERSION -le $NOW_KUBE_SERV_VERSION ]; then
+        echo "no"
+        return
+    fi
     local CMP_KUBE_SERV_VERSION=$( f-version-convert "1.17.0" )
     if [ $CMP_KUBE_SERV_VERSION -le $NOW_KUBE_SERV_VERSION ]; then
         echo "yes"
@@ -254,6 +287,7 @@ function f-kube-run-v() {
     RC=$? ; if [ $RC -ne 0 ]; then echo "kubectl version error. abort." ; return $RC; fi
 
     local namespace=
+    local serviceaccount=
     local kubectl_cmd_namespace_opt=
     local interactive=
     local tty=
@@ -289,6 +323,7 @@ function f-kube-run-v() {
     local image_pull_secrets_json=
     local node_select_json=
     local no_carry_on_proxy=
+    local no_carry_on_docker_host=
     # kubectl create secret docker-registry <name> --docker-server=DOCKER_REGISTRY_SERVER --docker-username=DOCKER_USER --docker-password=DOCKER_PASSWORD --docker-email=DOCKER_EMAIL
     local docker_registry_name=
     local docker_registry_username=
@@ -299,6 +334,7 @@ function f-kube-run-v() {
     local hostpath_volume_mounts_json=
     local hostpath_volumes_json=
     local generator_opt=
+    local dry_run=
 
     f-check-winpty 2>/dev/null
 
@@ -474,7 +510,12 @@ function f-kube-run-v() {
             continue
         fi
         if [ x"$1"x = x"--image-debian"x ]; then
-            image=registry.gitlab.com/george-pon/mydebian9docker:latest
+            image=registry.gitlab.com/george-pon/mydebian10docker:latest
+            shift
+            continue
+        fi
+        if [ x"$1"x = x"--image-debian-builder"x ]; then
+            image=registry.gitlab.com/george-pon/mydebian10builder:latest
             shift
             continue
         fi
@@ -574,6 +615,11 @@ function f-kube-run-v() {
             shift
             continue
         fi
+        if [ x"$1"x = x"--no-carry-on-docker-host"x -o x"$1"x = x"--no-docker-host"x ]; then
+            no_carry_on_docker_host=true
+            shift
+            continue
+        fi
         if [ x"$1"x = x"--docker-registry-name"x -o x"$1"x = x"--docker-registry-server"x ]; then
             docker_registry_name=$2
             shift
@@ -594,6 +640,11 @@ function f-kube-run-v() {
         fi
         if [ x"$1"x = x"--command"x ]; then
             command_line_pass_mode=yes
+            shift
+            continue
+        fi
+        if [ x"$1"x = x"--dry-run"x ]; then
+            dry_run=yes
             shift
             continue
         fi
@@ -630,6 +681,8 @@ function f-kube-run-v() {
             echo "        --limit-memory value          set resources.limits.memory value for pod"
             echo "        --runas  uid                  set runas user for pod"
             echo "        --no-proxy                    do not set proxy environment variables for pod"
+            echo "        --no-docker-host              do not set DOCKER_HOST environment variables for pod"
+            echo "        --dry-run                     print out pod yaml and exit."
             echo "        --docker-registry-server      create secrets for imagePullSecrets part 1"
             echo "                                      (https://index.docker.io/v1/ for DockerHub)"
             echo "                                      secret name regcred is generated"
@@ -660,6 +713,9 @@ function f-kube-run-v() {
     if [ -z "$namespace" ]; then
         namespace="default"
         kubectl_cmd_namespace_opt="--namespace $namespace"
+    fi
+    if [ -z "$serviceaccount" ]; then
+        serviceaccount="mycentos7docker-${namespace}"
     fi
     if [ -z "$pod_name_prefix" ]; then
         pod_name_prefix=${image##*/}
@@ -694,13 +750,23 @@ function f-kube-run-v() {
         fi
     fi
     if [ x"$carry_on_kubeconfig"x = x"yes"x  ]; then
-        carry_on_kubeconfig_file=$( realpath $( mktemp "$PWD/../kube-run-v-kubeconfig-XXXXXXXXXXXX" ) )
+        tmp_kubeconfig=$( mktemp "$PWD/../kube-run-v-kubeconfig-XXXXXXXXXXXX" )
+        RC=$? ; if [ $RC -ne 0 ]; then echo "  mktemp failed. abort." ; return 1; fi
+        carry_on_kubeconfig_file=$( realpath $tmp_kubeconfig )
         kubectl config view --raw > $carry_on_kubeconfig_file
         RC=$? ; if [ $RC -ne 0 ]; then echo "  kubectl config view failed. abort." ; return 1; fi
         pseudo_volume_list="$pseudo_volume_list $carry_on_kubeconfig_file:~/.kube/config"
     fi
 
-    # check kubectl run generator
+    # check kubectl run dry-run optin
+    dry_run_result=$( f-check-dry-run-pod )
+    if [ x"$dry_run_result"x = x"yes"x ] ; then
+        dry_run_opt=" --dry-run=client -o yaml "
+    else
+        dry_run_opt=" --dry-run -o yaml "
+    fi
+
+    # check kubectl run generator option
     generator_result=$( f-check-generator-run-pod )
     if [ x"$generator_result"x = x"yes"x ]; then
         generator_opt=" --generator=run-pod/v1 "
@@ -715,22 +781,22 @@ function f-kube-run-v() {
         RC=$? ; if [ $RC -ne 0 ]; then echo "create namespace error. abort." ; return $RC; fi
     fi
 
-    # setup service account
-    if  kubectl ${kubectl_cmd_namespace_opt} get serviceaccount mycentos7docker-${namespace} > /dev/null ; then
-        echo "  service account mycentos7docker-${namespace} found."
+    # setup serviceaccount
+    if  kubectl ${kubectl_cmd_namespace_opt} get serviceaccount ${serviceaccount} > /dev/null ; then
+        echo "  service account ${serviceaccount} found."
     else
-        kubectl ${kubectl_cmd_namespace_opt} create serviceaccount mycentos7docker-${namespace}
+        kubectl ${kubectl_cmd_namespace_opt} create serviceaccount ${serviceaccount}
         RC=$? ; if [ $RC -ne 0 ]; then echo "create serviceaccount error. abort." ; return $RC; fi
 
     fi
 
     # setup cluster role binding
-    if kubectl get clusterrolebinding mycentos7docker-${namespace} ; then
-        echo "  cluster role binding mycentos7docker-${namespace} found."
+    if kubectl get clusterrolebinding ${serviceaccount} ; then
+        echo "  cluster role binding ${serviceaccount} found."
     else
-        kubectl create clusterrolebinding mycentos7docker-${namespace} \
+        kubectl create clusterrolebinding ${serviceaccount} \
             --clusterrole cluster-admin \
-            --serviceaccount=${namespace}:mycentos7docker-${namespace}
+            --serviceaccount=${namespace}:${serviceaccount}
         RC=$? ; if [ $RC -ne 0 ]; then echo "create clusterrolebinding error. abort." ; return $RC; fi
     fi
     
@@ -760,21 +826,27 @@ function f-kube-run-v() {
         # support workingdir
         if [ -n "$workingdir" -o -n "$limits_memory" -o -n "$hostpath_volume_mounts_json" ]; then
             # PODの中をoverrideする場合は、全部ここに記述しないといけない；；
-            if [ -z "$no_carry_on_proxy" ]; then
-                for envproxy in http_proxy=$http_proxy https_proxy=$https_proxy ftp_proxy=$ftp_proxy no_proxy=$no_proxy DOCKER_HOST=$DOCKER_HOST
-                do
-                    local env_key_val=$envproxy
-                    local env_key=${env_key_val%%=*}
-                    local env_val=${env_key_val#*=}
-                    if [ -z "$env_opts" ]; then
-                        env_opts="--env $env_key=$env_val"
-                        env_json=' { "name":  "'$env_key'" , "value": "'$env_val'" } '
-                    else
-                        env_opts="$env_opts --env $env_key=$env_val"
-                        env_json="$env_json"' , {  "name" : "'$env_key'" , "value" : "'$env_val'" } '
-                    fi
-                done
+            tmp_docker_host_kv=
+            tmp_proxy_kv=
+            if [ -z "$no_carry_on_docker_host" ]; then
+                tmp_docker_host_kv="DOCKER_HOST=$DOCKER_HOST"
             fi
+            if [ -z "$no_carry_on_proxy" ]; then
+                tmp_proxy_kv="http_proxy=$http_proxy https_proxy=$https_proxy ftp_proxy=$ftp_proxy no_proxy=$no_proxy"
+            fi
+            for envproxy in  $tmp_proxy_kv  $tmp_docker_host_kv
+            do
+                local env_key_val=$envproxy
+                local env_key=${env_key_val%%=*}
+                local env_val=${env_key_val#*=}
+                if [ -z "$env_opts" ]; then
+                    env_opts="--env $env_key=$env_val"
+                    env_json=' { "name":  "'$env_key'" , "value": "'$env_val'" } '
+                else
+                    env_opts="$env_opts --env $env_key=$env_val"
+                    env_json="$env_json"' , {  "name" : "'$env_key'" , "value" : "'$env_val'" } '
+                fi
+            done
             workingdir_json=' "containers" : [ {
                 "name": "'$POD_NAME'" ,
                 "image": "'$image'",
@@ -808,42 +880,64 @@ function f-kube-run-v() {
                 fi
             fi
         done
-        override_base_json=' { "apiVersion": "v1", "spec" : { '"${override_buff}"' } } '
-        local kubectl_proxy_env_opt=
-        if [ -z "$no_carry_on_proxy" ]; then
-            kubectl_proxy_env_opt='--env='"http_proxy=${http_proxy}"' --env='"https_proxy=${https_proxy}"' --env='"ftp_proxy=${ftp_proxy}"' --env='"no_proxy=${no_proxy}"' --env='"DOCKER_HOST=${DOCKER_HOST}"
+        if [ x"$override_buff"x = x""x ] ; then
+            override_opt=" --overrides "
+            override_base_json=
+        else
+            override_opt=" --overrides "
+            override_base_json=' { "apiVersion": "v1", "spec" : { '"${override_buff}"' } } '
         fi
+        local kubectl_proxy_env_opt=
+        if [ -z "$no_carry_on_docker_host" ]; then
+            kubectl_proxy_env_opt="${kubectl_proxy_env_opt}"' --env='"DOCKER_HOST=${DOCKER_HOST} "
+        fi
+        if [ -z "$no_carry_on_proxy" ]; then
+            kubectl_proxy_env_opt="${kubectl_proxy_env_opt}"'--env='"http_proxy=${http_proxy}"' --env='"https_proxy=${https_proxy}"' --env='"ftp_proxy=${ftp_proxy}"' --env='"no_proxy=${no_proxy}"
+        fi
+
         # echo "override_base_json is $override_base_json"
         if true ; then
             # dry run
             echo "  "
             echo "  ### dry-run : Pod yaml info start"
+            echo ""
+            set -x
             kubectl run ${generator_opt} ${POD_NAME} --restart=Never \
-                --overrides  "${override_base_json}" \
+                ${override_opt}  "${override_base_json}" \
                 --image=$image \
                 $imagePullOpt \
-                --serviceaccount=mycentos7docker-${namespace} \
+                --serviceaccount=${serviceaccount} \
                 ${kubectl_cmd_namespace_opt} \
                 ${kubectl_proxy_env_opt} \
                 ${env_opts} \
-                --dry-run -o yaml \
-                --command -- tail -f $(  f-msys-escape '/dev/null' ) | awk '{print "  " $0;}'
-            RC=$? ; if [ $RC -ne 0 ]; then echo "kubectl dry-run error. abort." ; return $RC; fi
+                ${dry_run_opt} \
+                --command -- sleep 9999999
+            RC=$? 
+            set +x
+            if [ $RC -ne 0 ]; then echo "kubectl dry-run error. abort." ; return $RC; fi
+            echo ""
             echo "  ### dry-run : Pod yaml info end"
             echo "  "
         fi
 
+        # if dry-run , exit here
+        if [ x"$dry_run"x = x"yes"x ] ; then
+            echo "  dry_run mode. abort here."
+            return 0
+        fi
+
         # run
+        set -x
         kubectl run ${generator_opt} ${POD_NAME} --restart=Never \
             --image=$image \
             $imagePullOpt \
-            --overrides  "${override_base_json}" \
-            --serviceaccount=mycentos7docker-${namespace} \
+            ${override_opt}  "${override_base_json}" \
+            --serviceaccount=${serviceaccount} \
             ${kubectl_cmd_namespace_opt} \
-            ${kubectl_proxy_env_opt} \
-            ${env_opts} \
-            --command -- tail -f $(  f-msys-escape '/dev/null' )
-        RC=$? ; if [ $RC -ne 0 ]; then echo "kubectl run error. abort." ; return $RC; fi
+            ${kubectl_proxy_env_opt}  ${env_opts} -- sleep 9999999
+        RC=$?
+        set +x
+        if [ $RC -ne 0 ]; then echo "kubectl run error. abort." ; return $RC; fi
 
         # wait for pod Running
         local count=0
@@ -911,7 +1005,7 @@ function f-kube-run-v() {
             fi
 
             # kubectl cp
-            echo "  kubectl cp into pod"
+            echo "  kubectl cp into pod ${TMP_ARC_FILE}  ${TMP_DEST_MSYS2}"
             kubectl cp  ${kubectl_cmd_namespace_opt}  ${TMP_ARC_FILE}  ${TMP_DEST_MSYS2}
             RC=$? ; if [ $RC -ne 0 ]; then echo "kubectl cp error. abort." ; return $RC; fi
 
@@ -1055,15 +1149,21 @@ function f-kube-run-v() {
     # exec into pod
     if [ ! -z "$i_or_tty" ]; then
         # interactive mode
+        echo "  # main command run"
         echo "  base workdir name : $pseudo_workdir"
         echo "  interactive mode"
-        echo "  ${WINPTY_CMD} kubectl exec ${interactive}  ${tty}  ${kubectl_cmd_namespace_opt} ${POD_NAME}  -- bash --login"
+        set -x
         ${WINPTY_CMD} kubectl exec ${interactive}  ${tty}  ${kubectl_cmd_namespace_opt} ${POD_NAME}  -- bash --login
+        RC=$?
+        set +x
     else
+        echo "  # main command run"
         echo "  base workdir name : $pseudo_workdir"
         echo "  running command : $command_line"
-        echo "  ${WINPTY_CMD} kubectl exec                         ${kubectl_cmd_namespace_opt} ${POD_NAME}  -- bash --login -c  $command_line"
+        set -x
         ${WINPTY_CMD} kubectl exec                         ${kubectl_cmd_namespace_opt} ${POD_NAME}  -- bash --login -c  "$command_line"
+        RC=$?
+        set +x
     fi
 
     # after pod exit

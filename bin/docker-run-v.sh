@@ -352,7 +352,12 @@ function f-docker-run-v() {
             continue
         fi
         if [ x"$1"x = x"--image-debian"x ]; then
-            image=registry.gitlab.com/george-pon/mydebian9docker:latest
+            image=registry.gitlab.com/george-pon/mydebian10docker:latest
+            shift
+            continue
+        fi
+        if [ x"$1"x = x"--image-debian-builder"x ]; then
+            image=registry.gitlab.com/george-pon/mydebian10builder:latest
             shift
             continue
         fi
@@ -537,9 +542,9 @@ function f-docker-run-v() {
     # archive current directory
     local TMP_ARC_FILE=$( mktemp  "../${container_name}-XXXXXXXXXXXX.tar.gz" )
     local TMP_ARC_FILE_RECOVER=${TMP_ARC_FILE}-recover.sh
-    local TMP_ARC_FILE_IN_CONTAINER=$( echo $TMP_ARC_FILE | sed -e 's%^\.\./%/tmp/%g' )
+    local TMP_ARC_FILE_IN_CONTAINER=$( echo $TMP_ARC_FILE | sed -e 's%^\.\./%%g' )
     local TMP_DEST_FILE=${container_name}:${TMP_ARC_FILE}
-    local TMP_DEST_MSYS2=$( echo $TMP_DEST_FILE | sed -e 's%:\.\./%:/tmp/%g' )
+    local TMP_DEST_MSYS2=$( echo $TMP_DEST_FILE | sed -e 's%:\.\./%:%g' )
     local TMP_ARC_DIR=$( echo $TMP_ARC_FILE | sed -e 's%.tar.gz%%g' )
     local TMP_ARC_DIR_FILE=${TMP_ARC_DIR}/$( echo $TMP_ARC_FILE | sed -e 's%^../%%g' )
     local TMP_ARC_FILE_CURRENT_DIR=$( echo $TMP_ARC_FILE | sed -e 's%^../%%g' )
@@ -580,7 +585,7 @@ function f-docker-run-v() {
 
             # docker cp
             echo "  docker cp into container ... docker cp  ${TMP_ARC_FILE}  ${TMP_DEST_MSYS2}"
-            docker cp  ${TMP_ARC_FILE}  ${TMP_DEST_MSYS2}
+            docker cp  ${TMP_ARC_FILE} ${TMP_DEST_MSYS2}
             RC=$? ; if [ $RC -ne 0 ]; then echo "docker cp error. abort." ; return $RC; fi
 
             # docker exec ... import and extract archive
